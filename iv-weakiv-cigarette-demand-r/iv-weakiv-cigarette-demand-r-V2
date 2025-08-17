@@ -1,1 +1,595 @@
+##VERSION TWO(Revised for Brevity)
+# -----------------------------------------------------------------------------
+# 0) Setup
+# -----------------------------------------------------------------------------
+
+# Fail fast on missing packages (avoid auto-install in analysis scripts)
+.pkgs <- c(
+  "AER", "ivreg", "sandwich", "lmtest", "car", "broom",
+  "data.table", "ggplot2", "stargazer", "ivmodel"
+)
+.miss <- .pkgs[!vapply(.pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(.miss)) stop("Install missing packages: ", paste(.miss, collapse = ", "))
+
+suppressPackageStartupMessages({
+  library(AER)
+  library(ivreg)
+  library(sandwich)
+  library(lmtest)
+  library(car)
+  library(broom)
+  library(data.table)
+  library(ggplot2)
+  library(stargazer)
+  library(ivmodel)
+})
+set.seed(2025)
+
+# -----------------------------------------------------------------------------
+# 1) Data: load + quick sanity checks (CigarettesSW)
+# -----------------------------------------------------------------------------
+
+data("CigarettesSW")
+cat("Dataset dims (rows, cols):\n"); print(dim(CigarettesSW))
+cat("\nHead:\n"); print(utils::head(CigarettesSW))
+cat("\nStructure:\n"); str(CigarettesSW)
+cat("\nSummary:\n"); print(summary(CigarettesSW))
+cat("\nMissing by variable:\n")
+print(vapply(CigarettesSW, function(x) sum(is.na(x)), integer(1)))
+
+# -----------------------------------------------------------------------------
+# 2) Construction: real vars, logs; pick cross-section (1995)
+# -----------------------------------------------------------------------------
+
+dt <- as.data.table(CigarettesSW)
+
+.req <- c("packs", "price", "income", "population", "cpi", "year")
+.missv <- setdiff(.req, names(dt))
+if (length(.missv)) stop("Missing variables: ", paste(.missv, collapse = ", "))
+
+dt[, `:=`(
+  real_price     = price / cpi,
+  real_income_pc = (income / population) / cpi
+)]
+
+dt[, `:=`(
+  ln_quantity = log(packs),
+  ln_price    = log(real_price),
+  ln_income   = log(real_income_pc)
+)]
+
+# Identify tax instruments (policy variation)
+.tax_vars <- grep("tax", names(dt), value = TRUE, ignore.case = TRUE)
+if (!length(.tax_vars)) stop("No candidate tax instruments found.")
+
+# Cross-section (1995); keep object for downstream steps
+DT_MAIN <- dt[year == 1995]
+if (!nrow(DT_MAIN)) stop("Empty 1995 cross-section.")
+TAX_INSTRUMENTS <- .tax_vars
+
+cat("\nData ready: N = ", nrow(DT_MAIN), "; IVs: ", paste(TAX_INSTRUMENTS, collapse=", "),"\n", sep="")
+
+# -----------------------------------------------------------------------------
+# 3) First stage: select IVs; robust F + partial R^2
+# -----------------------------------------------------------------------------
+
+.available <- intersect(TAX_INSTRUMENTS, names(DT_MAIN))
+if (!length(.available)) stop("No usable instruments in cross-section.")
+
+# Preference order (typical in applied micro); then fill remainder
+.iv_priority <- c("salestax", "cigtax", "taxs", "tax")
+SELECTED_IVS <- c(intersect(.iv_priority, .available), setdiff(.available, .iv_priority))
+SELECTED_IVS <- SELECTED_IVS[seq_len(min(2L, length(SELECTED_IVS)))]
+cat("Selected IVs: ", paste(SELECTED_IVS, collapse=", "), "\n", sep="")
+
+# First-stage: ln_price on IVs + ln_income (robust VCOV)
+.fs_form <- reformulate(c(SELECTED_IVS, "ln_income"), response = "ln_price")
+FS_REGRESSION <- lm(.fs_form, data = DT_MAIN)
+VCOV_ROBUST <- sandwich::vcovHC(FS_REGRESSION, type = "HC1")
+FS_RESULTS <- lmtest::coeftest(FS_REGRESSION, vcov. = VCOV_ROBUST)
+
+# Robust joint F on excluded IVs
+.restr <- paste0(SELECTED_IVS, " = 0")
+FS_F_ROBUST <- car::linearHypothesis(FS_REGRESSION, .restr, vcov. = VCOV_ROBUST, test = "F")
+
+# Partial R^2 (after partialling out controls)
+.y_res <- residuals(lm(ln_price ~ ln_income, data = DT_MAIN))
+.iv_res <- sapply(SELECTED_IVS, function(z) residuals(lm(reformulate("ln_income", response = z), data = DT_MAIN)))
+FS_PARTIAL_R2 <- summary(lm(.y_res ~ .iv_res))$r.squared
+
+cat("\nFIRST STAGE (robust):\n"); print(FS_RESULTS, digits=4)
+cat("\nRobust F (IVs joint) = ", as.numeric(FS_F_ROBUST[["F"]][1]),
+    ", p = ", as.numeric(FS_F_ROBUST[["Pr(>F)"]][1]), "\n", sep="")
+cat("Partial R^2 (IVs|controls) = ", round(FS_PARTIAL_R2, 4), "\n", sep="")
+cat("Note: Compare to appropriate Stock–Yogo table for K=", length(SELECTED_IVS),
+    ", 1 endog; avoid hard-coding cutoffs.\n", sep="")
+
+# -----------------------------------------------------------------------------
+# 4) Baseline: OLS vs 2SLS (robust SEs) + diagnostics
+# -----------------------------------------------------------------------------
+
+.base_spec <- ln_quantity ~ ln_price + ln_income
+.iv_rhs <- paste(c("ln_income", SELECTED_IVS), collapse = " + ")
+.iv_spec <- as.formula(paste("ln_quantity ~ ln_price + ln_income |", .iv_rhs))
+
+OLS_BASELINE  <- lm(.base_spec, data = DT_MAIN)
+TSLS_BASELINE <- ivreg::ivreg(.iv_spec, data = DT_MAIN)
+
+VCOV_OLS_ROBUST  <- sandwich::vcovHC(OLS_BASELINE,  type = "HC1")
+VCOV_TSLS_ROBUST <- sandwich::vcovHC(TSLS_BASELINE, type = "HC1")
+
+cat("\nOLS (HC1):\n");  print(lmtest::coeftest(OLS_BASELINE,  vcov.=VCOV_OLS_ROBUST),  digits=4)
+cat("\n2SLS (HC1):\n"); print(lmtest::coeftest(TSLS_BASELINE, vcov.=VCOV_TSLS_ROBUST), digits=4)
+
+IV_DIAGNOSTICS <- summary(TSLS_BASELINE, vcov.=function(x) sandwich::vcovHC(x, type="HC1"), diagnostics=TRUE)$diagnostics
+cat("\nIV tests (robust):\n"); if(!is.null(IV_DIAGNOSTICS)) print(IV_DIAGNOSTICS, digits=4)
+
+PRICE_ELASTICITY_OLS  <- coef(OLS_BASELINE)["ln_price"]
+PRICE_ELASTICITY_2SLS <- coef(TSLS_BASELINE)["ln_price"]
+cat(sprintf("\nElasticity (price): OLS = %.3f, 2SLS = %.3f, diff = %.3f\n",
+            PRICE_ELASTICITY_OLS, PRICE_ELASTICITY_2SLS,
+            PRICE_ELASTICITY_2SLS - PRICE_ELASTICITY_OLS))
+
+# -----------------------------------------------------------------------------
+# 5) Anderson–Rubin (AR) confidence set (heteroskedasticity-robust)
+# -----------------------------------------------------------------------------
+
+# H0: beta = b0 via RF on (Y - b0 X) ~ controls + IVs; joint test on IVs
+.ar_p <- function(b0, data, ivs, ctl = "ln_income") {
+  y_adj <- with(data, ln_quantity - b0 * ln_price)
+  rf    <- lm(reformulate(c(ctl, ivs), response = "y_adj"), data = data)
+  Vhc   <- sandwich::vcovHC(rf, type = "HC1")
+  R     <- paste0(ivs, " = 0")
+  out   <- car::linearHypothesis(rf, R, vcov. = Vhc, test = "F")
+  as.numeric(out[["Pr(>F)"]][1])
+}
+
+b2sls <- coef(TSLS_BASELINE)[["ln_price"]]
+se2sls <- sqrt(diag(VCOV_TSLS_ROBUST))["ln_price"]
+if (!is.finite(se2sls) || se2sls <= 0) se2sls <- 0.3
+
+.half <- max(2, 12 * se2sls)
+.grid <- seq(b2sls - .half, b2sls + .half, length.out = 1001)
+.alpha <- 0.05
+.pv <- vapply(.grid, .ar_p, numeric(1), data = DT_MAIN, ivs = SELECTED_IVS)
+
+# Build union of nonrejected values (contiguous runs)
+.idx <- which(!is.na(.pv) & .pv >= .alpha)
+AR_CONFIDENCE_SET <- list()
+if (length(.idx)) {
+  runs <- split(.idx, cumsum(c(1, diff(.idx) != 1)))
+  AR_CONFIDENCE_SET <- lapply(runs, function(ix) c(min(.grid[ix]), max(.grid[ix])))
+}
+
+AR_TEST_ZERO        <- .ar_p(0,  DT_MAIN, SELECTED_IVS)
+AR_TEST_UNITELASTIC <- .ar_p(-1, DT_MAIN, SELECTED_IVS)
+
+cat("\nAR tests (p-values): H0 beta=0 -> ", sprintf("%.4f", AR_TEST_ZERO),
+    "; H0 beta=-1 -> ", sprintf("%.4f", AR_TEST_UNITELASTIC), "\n", sep="")
+if (length(AR_CONFIDENCE_SET)) {
+  cat("AR 95% set(s):\n"); for (i in seq_along(AR_CONFIDENCE_SET)) cat(i, ": ",
+    sprintf("[%.4f, %.4f]", AR_CONFIDENCE_SET[[i]][1], AR_CONFIDENCE_SET[[i]][2]), "\n", sep="")
+} else cat("AR 95% set: empty (suggests weak ID or misspecification).\n")
+
+# -----------------------------------------------------------------------------
+# 6) CLR + LIML/Fuller via ivmodel (weak-IV robust inference)
+# -----------------------------------------------------------------------------
+
+Y <- DT_MAIN$ln_quantity
+D <- DT_MAIN$ln_price
+Z <- as.matrix(DT_MAIN[, ..SELECTED_IVS])
+X <- as.matrix(DT_MAIN[, "ln_income", with = FALSE])
+
+IVMODEL_OBJECT <- ivmodel::ivmodel(Y = Y, D = D, Z = Z, X = X, intercept = TRUE)
+
+# CLR test / CI (weak-IV robust)
+CLR_INFERENCE <- ivmodel::CLR(IVMODEL_OBJECT, alpha = 0.05)
+CLR_CONFIDENCE_INTERVAL <- if (!is.null(CLR_INFERENCE$ci)) CLR_INFERENCE$ci else CLR_INFERENCE$CI
+
+# LIML + Fuller(k)
+.LIML  <- ivmodel::LIML(IVMODEL_OBJECT)
+.F1    <- ivmodel::Fuller(IVMODEL_OBJECT, alpha = 1)
+.F4    <- ivmodel::Fuller(IVMODEL_OBJECT, alpha = 4)
+
+.extract <- function(x){
+  est <- if ("beta" %in% names(x)) x$beta else x$point.est
+  se  <- if ("SE.robust" %in% names(x)) x$SE.robust else x$SE
+  c(estimate = as.numeric(est), std_error = as.numeric(se))
+}
+LIML_ESTIMATES     <- .extract(.LIML)
+FULLER1_ESTIMATES  <- .extract(.F1)
+FULLER4_ESTIMATES  <- .extract(.F4)
+
+cat("\nCLR: ")
+if (!is.null(CLR_INFERENCE$p.value)) cat("p=", sprintf("%.4f", CLR_INFERENCE$p.value), "; ", sep="")
+if (all(is.finite(CLR_CONFIDENCE_INTERVAL))) cat("95% CI= [",
+  sprintf("%.4f", CLR_CONFIDENCE_INTERVAL[1]), ", ", sprintf("%.4f", CLR_CONFIDENCE_INTERVAL[2]), "]\n", sep="") else cat("CI unavailable\n")
+
+cat("LIML: ", sprintf("beta=%.4f, SE=%.4f\n", LIML_ESTIMATES[1], LIML_ESTIMATES[2]), sep="")
+cat("Fuller(1): ", sprintf("beta=%.4f, SE=%.4f\n", FULLER1_ESTIMATES[1], FULLER1_ESTIMATES[2]), sep="")
+cat("Fuller(4): ", sprintf("beta=%.4f, SE=%.4f\n", FULLER4_ESTIMATES[1], FULLER4_ESTIMATES[2]), sep="")
+
+# -----------------------------------------------------------------------------
+# 7) Figure (analysis): estimates + asymptotic CIs + weak-IV sets
+# -----------------------------------------------------------------------------
+
+.est <- function(m, V, coef_name) {
+  b <- coef(m)[[coef_name]]; se <- sqrt(diag(V))[[coef_name]]
+  l <- b - qnorm(0.975)*se; u <- b + qnorm(0.975)*se
+  c(b=b, l=l, u=u)
+}
+
+E_OLS  <- .est(OLS_BASELINE,  VCOV_OLS_ROBUST,  "ln_price")
+E_2SLS <- .est(TSLS_BASELINE, VCOV_TSLS_ROBUST, "ln_price")
+
+# Add LIML/Fuller if finite
+rows <- list(
+  data.frame(method="OLS (CS)",   b=E_OLS["b"],  l=E_OLS["l"],  u=E_OLS["u"]),
+  data.frame(method="2SLS (CS)",  b=E_2SLS["b"], l=E_2SLS["l"], u=E_2SLS["u"]) 
+)
+if (all(is.finite(LIML_ESTIMATES))) {
+  bl <- LIML_ESTIMATES[1]; se <- LIML_ESTIMATES[2]
+  rows[[length(rows)+1]] <- data.frame(method="LIML (CS)", b=bl, l=bl-qnorm(0.975)*se, u=bl+qnorm(0.975)*se)
+}
+if (all(is.finite(FULLER1_ESTIMATES))) {
+  bl <- FULLER1_ESTIMATES[1]; se <- FULLER1_ESTIMATES[2]
+  rows[[length(rows)+1]] <- data.frame(method="Fuller(1) (CS)", b=bl, l=bl-qnorm(0.975)*se, u=bl+qnorm(0.975)*se)
+}
+if (all(is.finite(FULLER4_ESTIMATES))) {
+  bl <- FULLER4_ESTIMATES[1]; se <- FULLER4_ESTIMATES[2]
+  rows[[length(rows)+1]] <- data.frame(method="Fuller(4) (CS)", b=bl, l=bl-qnorm(0.975)*se, u=bl+qnorm(0.975)*se)
+}
+
+est_df <- do.call(rbind, rows)
+est_df$method <- factor(est_df$method, levels = rev(est_df$method))
+
+# Weak-IV robust intervals (CLR + AR), shown as background bands
+rob_df <- data.frame()
+if (exists("CLR_CONFIDENCE_INTERVAL") && all(is.finite(CLR_CONFIDENCE_INTERVAL))) {
+  rob_df <- rbind(rob_df, data.frame(label="CLR 95% CI", lo=CLR_CONFIDENCE_INTERVAL[1], hi=CLR_CONFIDENCE_INTERVAL[2]))
+}
+if (length(AR_CONFIDENCE_SET)) {
+  for (i in seq_along(AR_CONFIDENCE_SET)) {
+    rob_df <- rbind(rob_df, data.frame(label=paste0("AR 95% Set", if (length(AR_CONFIDENCE_SET)>1) paste0(" (",i,")") else ""),
+                                      lo=AR_CONFIDENCE_SET[[i]][1], hi=AR_CONFIDENCE_SET[[i]][2]))
+  }
+}
+
+g <- ggplot(est_df, aes(x=b, y=method)) +
+  {if (nrow(rob_df)) geom_rect(data=transform(rob_df, y0=0.5, y1=length(levels(est_df$method))+0.5),
+                               aes(xmin=lo, xmax=hi, ymin=y0, ymax=y1, fill=label),
+                               inherit.aes=FALSE, alpha=0.12)} +
+  geom_errorbarh(aes(xmin=l, xmax=u), height=0.18, linewidth=0.7) +
+  geom_point(size=2.2) +
+  geom_vline(xintercept=0, linetype="dashed", alpha=0.6) +
+  geom_vline(xintercept=-1, linetype="dotted", alpha=0.6) +
+  labs(title="Price Elasticity (log price)", subtitle="CS estimates with robust 95% CIs",
+       x="Elasticity", y=NULL, fill="Weak-IV sets") +
+  scale_fill_grey(start=0.45, end=0.8) +
+  theme_minimal(base_size=11) +
+  theme(panel.grid.minor=element_blank(), panel.grid.major.y=element_blank(),
+        plot.title=element_text(face="bold"), legend.position="bottom")
+
+if (!dir.exists("output")) dir.create("output")
+print(g)
+ggsave("output/price_elasticity_comparison.png", g, width=10, height=6, dpi=300, bg="white")
+
+# -----------------------------------------------------------------------------
+# 8) Robustness: instrument set sensitivity + leave-one-out
+# -----------------------------------------------------------------------------
+
+.fs_diag <- function(ivset, data, ctl="ln_income"){
+  m <- lm(reformulate(c(ivset, ctl), response="ln_price"), data=data)
+  V <- sandwich::vcovHC(m, type="HC1")
+  F <- car::linearHypothesis(m, paste0(ivset, " = 0"), vcov.=V, test="F")
+  yres <- residuals(lm(reformulate(ctl, response="ln_price"), data=data))
+  ivres <- lapply(ivset, function(iv) residuals(lm(reformulate(ctl, response=iv), data=data)))
+  r2 <- tryCatch(summary(lm(yres ~ ., data=as.data.frame(ivres)))$r.squared, error=function(e) NA_real_)
+  list(F=as.numeric(F[["F"]][1]), p=as.numeric(F[["Pr(>F)"]][1]), r2=r2)
+}
+
+.est_2sls <- function(ivset, data, ctl="ln_income"){
+  rhs <- paste(c(ctl, ivset), collapse=" + ")
+  f <- as.formula(paste("ln_quantity ~ ln_price +", ctl, "|", rhs))
+  m <- ivreg::ivreg(f, data=data)
+  V <- sandwich::vcovHC(m, type="HC1")
+  tab <- lmtest::coeftest(m, vcov.=V)
+  overid <- tryCatch(summary(m, vcov.=function(x) sandwich::vcovHC(x, type="HC1"), diagnostics=TRUE)$diagnostics, error=function(e) NULL)
+  overid_p <- NA_real_
+  if (!is.null(overid)) {
+    rn <- rownames(overid); j <- grep("Sargan|Hansen|Over-ident", rn, ignore.case=TRUE)
+    if (length(j)) overid_p <- suppressWarnings(as.numeric(overid[j[1], "p-value"]))
+  }
+  c(beta=coef(m)[["ln_price"]], se=sqrt(diag(V))["ln_price"], overid_p=overid_p)
+}
+
+specs <- lapply(SELECTED_IVS, function(z) c(z))
+if (length(SELECTED_IVS) > 1) specs <- c(specs, list(SELECTED_IVS))
+labels <- vapply(specs, function(v) paste(v, collapse=" + "), character(1))
+
+ROBUSTNESS_TABLE <- do.call(rbind, lapply(seq_along(specs), function(i){
+  ivs <- specs[[i]]
+  fs  <- .fs_diag(ivs, DT_MAIN)
+  est <- .est_2sls(ivs, DT_MAIN)
+  data.frame(specification=labels[i], k=length(ivs),
+             price_elasticity=est["beta"], robust_se=est["se"],
+             first_stage_f=fs$F, first_stage_pval=fs$p, partial_r2=fs$r2,
+             overid_pvalue=if (length(ivs)>1) est["overid_p"] else NA_real_,
+             row.names=NULL)
+}))
+
+# Leave-one-out (if overidentified)
+LEAVE_ONE_OUT_TABLE <- data.frame()
+if (length(SELECTED_IVS) > 1) {
+  for (z in SELECTED_IVS) {
+    ivs <- setdiff(SELECTED_IVS, z)
+    fs  <- .fs_diag(ivs, DT_MAIN)
+    est <- .est_2sls(ivs, DT_MAIN)
+    LEAVE_ONE_OUT_TABLE <- rbind(LEAVE_ONE_OUT_TABLE,
+      data.frame(excluded=z, remaining=paste(ivs, collapse=" + "),
+                 price_elasticity=est["beta"], robust_se=est["se"],
+                 first_stage_f=fs$F, first_stage_pval=fs$p, partial_r2=fs$r2,
+                 row.names=NULL))
+  }
+}
+
+cat("\nRobustness (spec grid):\n"); print(within(ROBUSTNESS_TABLE, {
+  price_elasticity <- round(price_elasticity,4); robust_se <- round(robust_se,4)
+  first_stage_f <- round(first_stage_f,2); first_stage_pval <- signif(first_stage_pval,3)
+  partial_r2 <- round(partial_r2,4); overid_pvalue <- ifelse(is.na(overid_pvalue), "—", signif(overid_pvalue,3))
+}), row.names=FALSE)
+
+if (nrow(LEAVE_ONE_OUT_TABLE)) { cat("\nLeave-one-out:\n"); print(within(LEAVE_ONE_OUT_TABLE,{
+  price_elasticity <- round(price_elasticity,4); robust_se <- round(robust_se,4)
+  first_stage_f <- round(first_stage_f,2); first_stage_pval <- signif(first_stage_pval,3)
+  partial_r2 <- round(partial_r2,4)
+}), row.names=FALSE) }
+
+# -----------------------------------------------------------------------------
+# 9) First-differences IV (within-state; 1995-1985)
+# -----------------------------------------------------------------------------
+
+selected_iv <- SELECTED_IVS
+
+# Rebuild panel to avoid hidden deps
+DT_PNL <- as.data.table(CigarettesSW)
+
+.reqp <- c("packs","price","income","population","cpi","year","state")
+.missp <- setdiff(.reqp, names(DT_PNL))
+if (length(.missp)) stop("Missing vars for panel: ", paste(.missp, collapse=", "))
+
+DT_PNL[, `:=`(
+  real_price     = price / cpi,
+  real_income_pc = (income / population) / cpi,
+  ln_quantity    = log(packs),
+  ln_price       = log(real_price),
+  ln_income      = log(real_income_pc)
+)]
+
+keep <- c("state","ln_quantity","ln_price","ln_income", selected_iv)
+P85 <- DT_PNL[year==1985, ..keep]
+P95 <- DT_PNL[year==1995, ..keep]
+if (!nrow(P85) || !nrow(P95)) stop("Missing 1985 or 1995 cross-sections.")
+setnames(P85, setdiff(names(P85),"state"), paste0(setdiff(names(P85),"state"),"_1985"))
+setnames(P95, setdiff(names(P95),"state"), paste0(setdiff(names(P95),"state"),"_1995"))
+FD_PANEL_DATA <- merge(P95, P85, by="state")
+if (!nrow(FD_PANEL_DATA)) stop("Empty balanced panel for differences.")
+
+FD_PANEL_DATA[, `:=`(
+  delta_ln_quantity = ln_quantity_1995 - ln_quantity_1985,
+  delta_ln_price    = ln_price_1995    - ln_price_1985,
+  delta_ln_income   = ln_income_1995   - ln_income_1985
+)]
+
+FD_INSTRUMENTS <- paste0("delta_", selected_iv)
+for (i in seq_along(selected_iv)) {
+  FD_PANEL_DATA[[FD_INSTRUMENTS[i]]] <- FD_PANEL_DATA[[paste0(selected_iv[i],"_1995")]] -
+                                        FD_PANEL_DATA[[paste0(selected_iv[i],"_1985")]]
+}
+
+# First-stage (FD)
+fs_fd <- lm(reformulate(c(FD_INSTRUMENTS, "delta_ln_income"), response="delta_ln_price"), data=FD_PANEL_DATA)
+V_fd  <- sandwich::vcovHC(fs_fd, type="HC1")
+FD_FIRST_STAGE_TEST <- car::linearHypothesis(fs_fd, paste0(FD_INSTRUMENTS, " = 0"), vcov.=V_fd, test="F")
+
+# Partial R^2 (FD)
+pr_fd <- residuals(lm(delta_ln_price ~ delta_ln_income, data=FD_PANEL_DATA))
+iv_res_fd <- lapply(FD_INSTRUMENTS, function(iv) residuals(lm(reformulate("delta_ln_income", response=iv), data=FD_PANEL_DATA)))
+FD_PARTIAL_R2 <- tryCatch(summary(lm(pr_fd ~ ., data=as.data.frame(iv_res_fd)))$r.squared, error=function(e) NA_real_)
+
+# Estimation (FD): OLS vs 2SLS
+FD_OLS_MODEL <- lm(delta_ln_quantity ~ delta_ln_price + delta_ln_income, data=FD_PANEL_DATA)
+FD_IV_MODEL  <- ivreg::ivreg(as.formula(paste("delta_ln_quantity ~ delta_ln_price + delta_ln_income |",
+                                paste(c("delta_ln_income", FD_INSTRUMENTS), collapse=" + "))),
+                             data=FD_PANEL_DATA)
+FD_VCOV_OLS_ROBUST <- sandwich::vcovHC(FD_OLS_MODEL, type="HC1")
+FD_VCOV_IV_ROBUST  <- sandwich::vcovHC(FD_IV_MODEL,  type="HC1")
+
+cat("\nFD first-stage robust F = ", as.numeric(FD_FIRST_STAGE_TEST[["F"]][1]),
+    ", p=", as.numeric(FD_FIRST_STAGE_TEST[["Pr(>F)"]][1]),
+    "; partial R^2 = ", round(FD_PARTIAL_R2,4), "\n", sep="")
+
+cat("\nFD-OLS (HC1):\n"); print(lmtest::coeftest(FD_OLS_MODEL, vcov.=FD_VCOV_OLS_ROBUST), digits=4)
+cat("\nFD-2SLS (HC1):\n"); print(lmtest::coeftest(FD_IV_MODEL,  vcov.=FD_VCOV_IV_ROBUST),  digits=4)
+
+FD_PRICE_ELASTICITY_OLS <- coef(FD_OLS_MODEL)["delta_ln_price"]
+FD_PRICE_ELASTICITY_IV  <- coef(FD_IV_MODEL)["delta_ln_price"]
+cat(sprintf("\nFD elasticities: OLS = %.4f, 2SLS = %.4f (diff = %.4f)\n",
+            FD_PRICE_ELASTICITY_OLS, FD_PRICE_ELASTICITY_IV,
+            FD_PRICE_ELASTICITY_IV - FD_PRICE_ELASTICITY_OLS))
+
+# -----------------------------------------------------------------------------
+# 10) Comparison table (CS vs FD; robust SEs)
+# -----------------------------------------------------------------------------
+
+ci95 <- function(b, se) if (is.finite(b) && is.finite(se) && se>0) c(b - qnorm(0.975)*se, b + qnorm(0.975)*se) else c(NA,NA)
+
+cs_b_ols <- coef(OLS_BASELINE)["ln_price"]; cs_se_ols <- sqrt(diag(VCOV_OLS_ROBUST))["ln_price"]
+cs_b_iv  <- coef(TSLS_BASELINE)["ln_price"]; cs_se_iv  <- sqrt(diag(VCOV_TSLS_ROBUST))["ln_price"]
+fd_b_ols <- coef(FD_OLS_MODEL)["delta_ln_price"]; fd_se_ols <- sqrt(diag(FD_VCOV_OLS_ROBUST))["delta_ln_price"]
+fd_b_iv  <- coef(FD_IV_MODEL)["delta_ln_price"];  fd_se_iv  <- sqrt(diag(FD_VCOV_IV_ROBUST))["delta_ln_price"]
+
+comparison_table <- data.frame(
+  specification   = c("Cross-Section: OLS","Cross-Section: 2SLS","First-Difference: OLS","First-Difference: 2SLS"),
+  price_elasticity= c(cs_b_ols, cs_b_iv, fd_b_ols, fd_b_iv),
+  robust_se       = c(cs_se_ols, cs_se_iv, fd_se_ols, fd_se_iv),
+  ci_95_lower     = c(ci95(cs_b_ols, cs_se_ols)[1], ci95(cs_b_iv, cs_se_iv)[1], ci95(fd_b_ols, fd_se_ols)[1], ci95(fd_b_iv, fd_se_iv)[1]),
+  ci_95_upper     = c(ci95(cs_b_ols, cs_se_ols)[2], ci95(cs_b_iv, cs_se_iv)[2], ci95(fd_b_ols, fd_se_ols)[2], ci95(fd_b_iv, fd_se_iv)[2]),
+  sample_size     = c(nobs(OLS_BASELINE), nobs(TSLS_BASELINE), nobs(FD_OLS_MODEL), nobs(FD_IV_MODEL)),
+  first_stage_f   = c(NA, as.numeric(FS_F_ROBUST[["F"]][1]), NA, as.numeric(FD_FIRST_STAGE_TEST[["F"]][1])),
+  first_stage_pval= c(NA, as.numeric(FS_F_ROBUST[["Pr(>F)"]][1]), NA, as.numeric(FD_FIRST_STAGE_TEST[["Pr(>F)"]][1])),
+  partial_r2      = c(NA, FS_PARTIAL_R2, NA, FD_PARTIAL_R2),
+  row.names = NULL
+)
+
+robust_intervals_table <- data.frame(
+  method = c("CLR 95% CI (CS)", "Anderson–Rubin 95% Set"),
+  lower_bound = c(if (exists("CLR_CONFIDENCE_INTERVAL")) CLR_CONFIDENCE_INTERVAL[1] else NA_real_,
+                  if (length(AR_CONFIDENCE_SET)) AR_CONFIDENCE_SET[[1]][1] else NA_real_),
+  upper_bound = c(if (exists("CLR_CONFIDENCE_INTERVAL")) CLR_CONFIDENCE_INTERVAL[2] else NA_real_,
+                  if (length(AR_CONFIDENCE_SET)) AR_CONFIDENCE_SET[[1]][2] else NA_real_)
+)
+
+cat("\nComparison (key rows):\n"); print(within(comparison_table,{
+  price_elasticity <- round(price_elasticity,4); robust_se <- round(robust_se,4)
+  ci_95_lower <- round(ci_95_lower,4); ci_95_upper <- round(ci_95_upper,4)
+  first_stage_f <- ifelse(is.na(first_stage_f), "—", sprintf("%.2f", first_stage_f))
+  first_stage_pval <- ifelse(is.na(first_stage_pval), "—", sprintf("%.3f", first_stage_pval))
+  partial_r2 <- ifelse(is.na(partial_r2), "—", sprintf("%.4f", partial_r2))
+}), row.names=FALSE)
+
+cat("\nWeak-IV robust sets:\n"); print(within(robust_intervals_table,{
+  lower_bound <- ifelse(is.na(lower_bound), "—", sprintf("%.4f", lower_bound))
+  upper_bound <- ifelse(is.na(upper_bound), "—", sprintf("%.4f", upper_bound))
+}), row.names=FALSE)
+
+if (!dir.exists("output")) dir.create("output")
+utils::write.csv(comparison_table,      "output/elasticity_comparison_table.csv", row.names=FALSE)
+utils::write.csv(robust_intervals_table, "output/robust_confidence_intervals.csv", row.names=FALSE)
+
+# -----------------------------------------------------------------------------
+# 11) Monte Carlo: weak vs strong instruments (finite-sample behavior)
+# -----------------------------------------------------------------------------
+
+.sim_one <- function(n=100, beta=-0.8, pi=0.5, rho=0.6, kx=1, het=TRUE){
+  X <- matrix(rnorm(n*kx), n, kx); colnames(X) <- paste0("x",1:kx)
+  Z <- rnorm(n)
+  e1 <- rnorm(n); e2 <- rnorm(n)
+  U  <- e1; V <- rho*e1 + sqrt(1-rho^2)*e2
+  if (het) {
+    h <- 0.5 + abs(X[,1]); U <- U*h; V <- V*h
+  }
+  D <- pi*Z + X%*%rep(0.3,kx) + V
+  Y <- beta*D + X%*%rep(0.1,kx) + U
+  dat <- data.frame(Y=Y, D=D, Z=Z, X)
+
+  ols <- lm(as.formula(paste("Y ~ D +", paste(colnames(X), collapse=" + "))), data=dat)
+  V_ols <- sandwich::vcovHC(ols, type="HC1")
+  b_ols <- coef(ols)["D"]; se_ols <- sqrt(diag(V_ols))["D"]
+  ci_ols <- c(b_ols - qnorm(0.975)*se_ols, b_ols + qnorm(0.975)*se_ols)
+
+  ivf <- as.formula(paste("Y ~ D +", paste(colnames(X), collapse=" + "), "| Z +", paste(colnames(X), collapse=" + ")))
+  ts  <- ivreg::ivreg(ivf, data=dat)
+  V_ts <- sandwich::vcovHC(ts, type="HC1")
+  b_ts <- coef(ts)["D"]; se_ts <- sqrt(diag(V_ts))["D"]
+  ci_ts <- c(b_ts - qnorm(0.975)*se_ts, b_ts + qnorm(0.975)*se_ts)
+
+  ivm <- try(ivmodel::ivmodel(Y=dat$Y, D=dat$D, Z=as.matrix(dat$Z), X=as.matrix(dat[,colnames(X),drop=FALSE]), intercept=TRUE), silent=TRUE)
+  b_li <- se_li <- NA_real_
+  if (!inherits(ivm, "try-error")) {
+    L <- try(ivmodel::LIML(ivm), silent=TRUE)
+    if (!inherits(L, "try-error")) {
+      b_li <- if ("beta" %in% names(L)) L$beta else L$point.est
+      se_li <- if ("SE.robust" %in% names(L)) L$SE.robust else L$SE
+    }
+  }
+  ci_li <- if (is.finite(b_li) && is.finite(se_li) && se_li>0) c(b_li - qnorm(0.975)*se_li, b_li + qnorm(0.975)*se_li) else c(NA,NA)
+
+  ci_clr <- c(NA,NA)
+  if (!inherits(ivm, "try-error")) {
+    C <- try(ivmodel::CLR(ivm), silent=TRUE)
+    if (!inherits(C, "try-error")) ci_clr <- if (!is.null(C$ci)) C$ci else C$CI
+  }
+
+  c(est_ols=b_ols, est_tsls=b_ts, est_liml=b_li,
+    cov_ols=as.numeric(beta>=ci_ols[1] && beta<=ci_ols[2]),
+    cov_tsls=as.numeric(beta>=ci_ts[1] && beta<=ci_ts[2]),
+    cov_liml=as.numeric(is.finite(ci_li[1]) && beta>=ci_li[1] && beta<=ci_li[2]),
+    cov_clr=as.numeric(is.finite(ci_clr[1]) && beta>=ci_clr[1] && beta<=ci_clr[2]))
+}
+
+.run_mc <- function(R=500, pi=0.5, label="Strong IV"){
+  res <- t(replicate(R, .sim_one(pi=pi)))
+  beta <- -0.8
+  data.frame(
+    regime = label, pi = pi, R = R,
+    bias_ols = mean(res[,"est_ols"] - beta, na.rm=TRUE),
+    bias_tsls= mean(res[,"est_tsls"] - beta, na.rm=TRUE),
+    bias_liml= mean(res[,"est_liml"] - beta, na.rm=TRUE),
+    cov_ols = mean(res[,"cov_ols"], na.rm=TRUE),
+    cov_tsls= mean(res[,"cov_tsls"], na.rm=TRUE),
+    cov_liml= mean(res[,"cov_liml"], na.rm=TRUE),
+    cov_clr = mean(res[,"cov_clr"], na.rm=TRUE)
+  )
+}
+
+strong_iv <- .run_mc(R=500, pi=0.5,  label="Strong IV")
+weak_iv   <- .run_mc(R=500, pi=0.05, label="Weak IV")
+monte_carlo_summary <- rbind(strong_iv, weak_iv)
+
+cat("\nMonte Carlo (coverage/bias):\n"); print(within(monte_carlo_summary,{
+  bias_ols <- round(bias_ols,4); bias_tsls <- round(bias_tsls,4); bias_liml <- round(bias_liml,4)
+  cov_ols <- round(cov_ols,3);   cov_tsls <- round(cov_tsls,3);   cov_liml <- round(cov_liml,3); cov_clr <- round(cov_clr,3)
+}), row.names=FALSE)
+
+utils::write.csv(monte_carlo_summary, "output/monte_carlo_weak_iv_simulation.csv", row.names=FALSE)
+
+# -----------------------------------------------------------------------------
+# 12) figure (lean): vector PDF + PNG; minimal replication log
+# -----------------------------------------------------------------------------
+
+# Use earlier "g" if available; otherwise rebuild from est_df/rob_df
+if (!exists("g")) {
+  if (!exists("est_df")) stop("No estimates to plot.")
+  g <- ggplot(est_df, aes(x=b, y=method)) +
+    {if (nrow(rob_df)) geom_rect(data=transform(rob_df, y0=0.5, y1=length(levels(est_df$method))+0.5),
+                                 aes(xmin=lo, xmax=hi, ymin=y0, ymax=y1, fill=label),
+                                 inherit.aes=FALSE, alpha=0.12)} +
+    geom_errorbarh(aes(xmin=l, xmax=u), height=0.18, linewidth=0.7) +
+    geom_point(size=2.2) +
+    geom_vline(xintercept=0, linetype="dashed", alpha=0.6) +
+    geom_vline(xintercept=-1, linetype="dotted", alpha=0.6) +
+    labs(title="Price Elasticity (log price)", subtitle="Robust 95% CIs; weak-IV sets shaded",
+         x="Elasticity", y=NULL, fill="Weak-IV sets") +
+    scale_fill_grey(start=0.45, end=0.8) +
+    theme_minimal(base_size=11) +
+    theme(panel.grid.minor=element_blank(), panel.grid.major.y=element_blank(),
+          plot.title=element_text(face="bold"), legend.position="bottom")
+}
+
+# Save PDF (use cairo if available)
+.dev <- if (isTRUE(grDevices::capabilities()["cairo"])) cairo_pdf else pdf
+.do_pdf <- function(file, expr) { grDevices::pdf(NULL); on.exit(try(grDevices::dev.off(), silent=TRUE), add=TRUE); }
+
+if (!dir.exists("output")) dir.create("output")
+tryCatch({ggsave("output/figure_price_elasticity_publication.pdf", g, width=7.5, height=4.5, dpi=300, device = if (isTRUE(grDevices::capabilities()["cairo"])) cairo_pdf else NULL, bg="white")}, error=function(e){
+  ggsave("output/figure_price_elasticity_publication.pdf", g, width=7.5, height=4.5, dpi=300, bg="white")
+})
+
+ggsave("output/figure_price_elasticity_publication.png", g, width=7.5, height=4.5, dpi=300, bg="white")
+
+# Minimal replication info
+con <- file("output/minimal_session_info.txt", open="wt")
+writeLines(c("MINIMAL REPLICATION INFO",
+             paste0("Generated: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")),
+             "Packages:",
+             paste(sprintf("%s: %s", .pkgs[.pkgs %in% loadedNamespaces()],
+                           vapply(.pkgs[.pkgs %in% loadedNamespaces()], packageVersion, character(1))),
+             "R session:", utils::capture.output(sessionInfo())
+), con)
+close(con)
+
+cat("\nFiles:\n - output/price_elasticity_comparison.png\n - output/figure_price_elasticity_publication.(pdf|png)\n - output/elasticity_comparison_table.csv\n - output/robust_confidence_intervals.csv\n - output/monte_carlo_weak_iv_simulation.csv\n - output/minimal_session_info.txt\n")
+
+
 
