@@ -1,7 +1,5 @@
 ##VERSION TWO(Revised for Brevity)
-# -----------------------------------------------------------------------------
-# 0) Setup
-# -----------------------------------------------------------------------------
+#Setup
 
 # Fail fast on missing packages (avoid auto-install in analysis scripts)
 .pkgs <- c(
@@ -25,9 +23,7 @@ suppressPackageStartupMessages({
 })
 set.seed(2025)
 
-# -----------------------------------------------------------------------------
-# 1) Data: load + quick sanity checks (CigarettesSW)
-# -----------------------------------------------------------------------------
+# Data: load + quick sanity checks (CigarettesSW)
 
 data("CigarettesSW")
 cat("Dataset dims (rows, cols):\n"); print(dim(CigarettesSW))
@@ -37,9 +33,7 @@ cat("\nSummary:\n"); print(summary(CigarettesSW))
 cat("\nMissing by variable:\n")
 print(vapply(CigarettesSW, function(x) sum(is.na(x)), integer(1)))
 
-# -----------------------------------------------------------------------------
-# 2) Construction: real vars, logs; pick cross-section (1995)
-# -----------------------------------------------------------------------------
+# Construction: real vars, logs; pick cross-section (1995)
 
 dt <- as.data.table(CigarettesSW)
 
@@ -69,9 +63,7 @@ TAX_INSTRUMENTS <- .tax_vars
 
 cat("\nData ready: N = ", nrow(DT_MAIN), "; IVs: ", paste(TAX_INSTRUMENTS, collapse=", "),"\n", sep="")
 
-# -----------------------------------------------------------------------------
-# 3) First stage: select IVs; robust F + partial R^2
-# -----------------------------------------------------------------------------
+# select IVs; robust F + partial R^2
 
 .available <- intersect(TAX_INSTRUMENTS, names(DT_MAIN))
 if (!length(.available)) stop("No usable instruments in cross-section.")
@@ -104,9 +96,7 @@ cat("Partial R^2 (IVs|controls) = ", round(FS_PARTIAL_R2, 4), "\n", sep="")
 cat("Note: Compare to appropriate Stock–Yogo table for K=", length(SELECTED_IVS),
     ", 1 endog; avoid hard-coding cutoffs.\n", sep="")
 
-# -----------------------------------------------------------------------------
-# 4) Baseline: OLS vs 2SLS (robust SEs) + diagnostics
-# -----------------------------------------------------------------------------
+#  Baseline: OLS vs 2SLS (robust SEs) + diagnostics
 
 .base_spec <- ln_quantity ~ ln_price + ln_income
 .iv_rhs <- paste(c("ln_income", SELECTED_IVS), collapse = " + ")
@@ -130,9 +120,7 @@ cat(sprintf("\nElasticity (price): OLS = %.3f, 2SLS = %.3f, diff = %.3f\n",
             PRICE_ELASTICITY_OLS, PRICE_ELASTICITY_2SLS,
             PRICE_ELASTICITY_2SLS - PRICE_ELASTICITY_OLS))
 
-# -----------------------------------------------------------------------------
-# 5) Anderson–Rubin (AR) confidence set (heteroskedasticity-robust)
-# -----------------------------------------------------------------------------
+# Anderson–Rubin (AR) confidence set (heteroskedasticity-robust)
 
 # H0: beta = b0 via RF on (Y - b0 X) ~ controls + IVs; joint test on IVs
 .ar_p <- function(b0, data, ivs, ctl = "ln_income") {
@@ -171,9 +159,7 @@ if (length(AR_CONFIDENCE_SET)) {
     sprintf("[%.4f, %.4f]", AR_CONFIDENCE_SET[[i]][1], AR_CONFIDENCE_SET[[i]][2]), "\n", sep="")
 } else cat("AR 95% set: empty (suggests weak ID or misspecification).\n")
 
-# -----------------------------------------------------------------------------
-# 6) CLR + LIML/Fuller via ivmodel (weak-IV robust inference)
-# -----------------------------------------------------------------------------
+#  CLR + LIML/Fuller via ivmodel (weak-IV robust inference)
 
 Y <- DT_MAIN$ln_quantity
 D <- DT_MAIN$ln_price
@@ -209,9 +195,7 @@ cat("LIML: ", sprintf("beta=%.4f, SE=%.4f\n", LIML_ESTIMATES[1], LIML_ESTIMATES[
 cat("Fuller(1): ", sprintf("beta=%.4f, SE=%.4f\n", FULLER1_ESTIMATES[1], FULLER1_ESTIMATES[2]), sep="")
 cat("Fuller(4): ", sprintf("beta=%.4f, SE=%.4f\n", FULLER4_ESTIMATES[1], FULLER4_ESTIMATES[2]), sep="")
 
-# -----------------------------------------------------------------------------
-# 7) Figure (analysis): estimates + asymptotic CIs + weak-IV sets
-# -----------------------------------------------------------------------------
+# Figure (analysis): estimates + asymptotic CIs + weak-IV sets
 
 .est <- function(m, V, coef_name) {
   b <- coef(m)[[coef_name]]; se <- sqrt(diag(V))[[coef_name]]
@@ -274,9 +258,7 @@ if (!dir.exists("output")) dir.create("output")
 print(g)
 ggsave("output/price_elasticity_comparison.png", g, width=10, height=6, dpi=300, bg="white")
 
-# -----------------------------------------------------------------------------
-# 8) Robustness: instrument set sensitivity + leave-one-out
-# -----------------------------------------------------------------------------
+# Robustness: instrument set sensitivity + leave-one-out
 
 .fs_diag <- function(ivset, data, ctl="ln_income"){
   m <- lm(reformulate(c(ivset, ctl), response="ln_price"), data=data)
@@ -345,9 +327,7 @@ if (nrow(LEAVE_ONE_OUT_TABLE)) { cat("\nLeave-one-out:\n"); print(within(LEAVE_O
   partial_r2 <- round(partial_r2,4)
 }), row.names=FALSE) }
 
-# -----------------------------------------------------------------------------
-# 9) First-differences IV (within-state; 1995-1985)
-# -----------------------------------------------------------------------------
+# First-differences IV (within-state; 1995-1985)
 
 selected_iv <- SELECTED_IVS
 
@@ -418,9 +398,7 @@ cat(sprintf("\nFD elasticities: OLS = %.4f, 2SLS = %.4f (diff = %.4f)\n",
             FD_PRICE_ELASTICITY_OLS, FD_PRICE_ELASTICITY_IV,
             FD_PRICE_ELASTICITY_IV - FD_PRICE_ELASTICITY_OLS))
 
-# -----------------------------------------------------------------------------
-# 10) Comparison table (CS vs FD; robust SEs)
-# -----------------------------------------------------------------------------
+# Comparison table (CS vs FD; robust SEs)
 
 ci95 <- function(b, se) if (is.finite(b) && is.finite(se) && se>0) c(b - qnorm(0.975)*se, b + qnorm(0.975)*se) else c(NA,NA)
 
@@ -467,9 +445,7 @@ if (!dir.exists("output")) dir.create("output")
 utils::write.csv(comparison_table,      "output/elasticity_comparison_table.csv", row.names=FALSE)
 utils::write.csv(robust_intervals_table, "output/robust_confidence_intervals.csv", row.names=FALSE)
 
-# -----------------------------------------------------------------------------
-# 11) Monte Carlo: weak vs strong instruments (finite-sample behavior)
-# -----------------------------------------------------------------------------
+# Comparison table (CS vs FD; robust SEs)
 
 .sim_one <- function(n=100, beta=-0.8, pi=0.5, rho=0.6, kx=1, het=TRUE){
   X <- matrix(rnorm(n*kx), n, kx); colnames(X) <- paste0("x",1:kx)
@@ -544,9 +520,7 @@ cat("\nMonte Carlo (coverage/bias):\n"); print(within(monte_carlo_summary,{
 
 utils::write.csv(monte_carlo_summary, "output/monte_carlo_weak_iv_simulation.csv", row.names=FALSE)
 
-# -----------------------------------------------------------------------------
-# 12) figure (lean): vector PDF + PNG; minimal replication log
-# -----------------------------------------------------------------------------
+# figure (lean): vector PDF + PNG; minimal replication log
 
 # Use earlier "g" if available; otherwise rebuild from est_df/rob_df
 if (!exists("g")) {
